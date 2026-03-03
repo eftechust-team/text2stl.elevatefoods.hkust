@@ -1064,7 +1064,7 @@
             setActiveLayerCard(layerIndex);
             const selCanvas = document.getElementById('selectCanvas');
             selCanvas.style.display = 'block';
-            const selCtx = selCanvas.getContext('2d');
+            const selCtx = selCanvas.getContext('2d', { willReadFrequently: true });
             const editedImgEl = document.getElementById('editedImageDisplay');
             if (!editedImgEl || !editedImgEl.src) {
                 alert('Please finish editing the base image first.');
@@ -1134,7 +1134,7 @@
                 const tempCanvas = document.createElement('canvas');
                 tempCanvas.width = width * scale;
                 tempCanvas.height = height * scale;
-                const tempCtx = tempCanvas.getContext('2d');
+                const tempCtx = tempCanvas.getContext('2d', { willReadFrequently: true });
                 
                 // Draw at high resolution
                 const tempImg = tempCtx.createImageData(tempCanvas.width, tempCanvas.height);
@@ -1166,7 +1166,7 @@
                 const outCanvas = document.createElement('canvas');
                 outCanvas.width = width;
                 outCanvas.height = height;
-                const outCtx = outCanvas.getContext('2d');
+                const outCtx = outCanvas.getContext('2d', { willReadFrequently: true });
                 outCtx.imageSmoothingEnabled = true;
                 outCtx.imageSmoothingQuality = 'high';
                 outCtx.drawImage(tempCanvas, 0, 0, width, height);
@@ -1227,7 +1227,7 @@
                 const offCanvas = document.createElement('canvas');
                 offCanvas.width = width * s;
                 offCanvas.height = height * s;
-                const offCtx = offCanvas.getContext('2d');
+                const offCtx = offCanvas.getContext('2d', { willReadFrequently: true });
                 offCtx.clearRect(0, 0, offCanvas.width, offCanvas.height);
                 offCtx.fillStyle = '#000';
                 offCtx.beginPath();
@@ -1270,7 +1270,7 @@
                 const offCanvas = document.createElement('canvas');
                 offCanvas.width = width * s;
                 offCanvas.height = height * s;
-                const offCtx = offCanvas.getContext('2d');
+                const offCtx = offCanvas.getContext('2d', { willReadFrequently: true });
                 offCtx.clearRect(0, 0, offCanvas.width, offCanvas.height);
 
                 // Draw mask at high resolution
@@ -1306,17 +1306,18 @@
                 const outCanvas = document.createElement('canvas');
                 outCanvas.width = width;
                 outCanvas.height = height;
-                const outCtx = outCanvas.getContext('2d');
+                const outCtx = outCanvas.getContext('2d', { willReadFrequently: true });
                 outCtx.imageSmoothingEnabled = true;
                 outCtx.imageSmoothingQuality = 'high';
                 outCtx.drawImage(offCanvas, 0, 0, outCanvas.width, outCanvas.height);
 
-                // Threshold to clean binary mask
+                // Threshold to clean binary mask — use high threshold (>200) so blur bleed
+                // from nearby selected pixels does not fill hollow interiors.
                 const outImg = outCtx.getImageData(0, 0, width, height);
                 const outData = outImg.data;
                 for (let i = 0; i < outData.length; i += 4) {
                     const alpha = outData[i + 3];
-                    if (alpha > 90) {
+                    if (alpha > 200) {
                         outData[i] = 0; outData[i + 1] = 0; outData[i + 2] = 0; outData[i + 3] = 255;
                     } else {
                         outData[i] = 255; outData[i + 1] = 255; outData[i + 2] = 255; outData[i + 3] = 255;
@@ -1335,7 +1336,7 @@
                 const offCanvas = document.createElement('canvas');
                 offCanvas.width = w;
                 offCanvas.height = h;
-                const offCtx = offCanvas.getContext('2d');
+                const offCtx = offCanvas.getContext('2d', { willReadFrequently: true });
                 const img = offCtx.createImageData(w, h);
                 const data = img.data;
 
@@ -1469,10 +1470,8 @@
                     }
                 }
 
-                const smoothedLocal = smoothMaskLight(localMask, w, h, 1);
-                
-                // Dilate only the local selection, then merge
-                const dilatedLocal = expandMaskSmooth(smoothedLocal, selectionDilationPx);
+                // Dilate the local selection directly (skip smoothMaskLight - too expensive and fills hollows)
+                const dilatedLocal = expandMaskSmooth(localMask, selectionDilationPx);
                 if (editMode === 'add') {
                     for (let i = 0; i < selectionMask.length; i++) {
                         if (dilatedLocal[i] === 1) selectionMask[i] = 1;
@@ -1527,9 +1526,8 @@
                     stack.push([x + 1, y], [x - 1, y], [x, y + 1], [x, y - 1]);
                 }
 
-                // Light smoothing + dilation only the local selection, then merge
-                const smoothedLocal = smoothMaskLight(localMask, w, h, 1);
-                const dilatedLocal = expandMaskSmooth(smoothedLocal, selectionDilationPx);
+                // Dilate the local selection directly (skip smoothMaskLight - too expensive and fills hollows)
+                const dilatedLocal = expandMaskSmooth(localMask, selectionDilationPx);
                 if (editMode === 'add') {
                     for (let i = 0; i < selectionMask.length; i++) {
                         if (dilatedLocal[i] === 1) selectionMask[i] = 1;
@@ -1607,11 +1605,10 @@
             };
             
             document.getElementById('confirmSelection').onclick = () => {
-                // Light smoothing to preserve details
-                const smoothedMask = smoothSelectionMask(selectionMask, canvas.width, canvas.height, 2);
-
-                // Supersample with minimal blur - just enough to anti-alias pixel edges
-                const finalSelection = renderSmoothedSelection(smoothedMask, canvas.width, canvas.height, 6, 0.8);
+                // Skip smoothSelectionMask (blur-based) to avoid filling hollow shapes.
+                // Use the raw selectionMask directly, with a tiny anti-alias blur (0.5px at 6x
+                // scale) that only smooths subpixel jaggies without bridging across hollows.
+                const finalSelection = renderSmoothedSelection(selectionMask, canvas.width, canvas.height, 6, 0.5);
                 
                 // Create temporary canvas to generate data URL
                 const tempCanvas = document.createElement('canvas');
