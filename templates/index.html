@@ -377,7 +377,7 @@
                     <button id="fastGenerateBtn" style="flex: 1; padding: 20px; background: #27ae60; font-size: 16px; display: flex; flex-direction: column; align-items: center; gap: 10px;">
                         <span style="font-size: 24px;">⚡</span>
                         <span style="font-weight: 700;">Fast Generate</span>
-                        <span style="font-size: 12px; font-weight: 400; opacity: 0.9;">Automatically extract and fill shape</span>
+                        <span style="font-size: 12px; font-weight: 400; opacity: 0.9;">Extract black pixels as hollow shell</span>
                     </button>
                     
                     <button id="manualEditBtn" style="flex: 1; padding: 20px; background: #667eea; font-size: 16px; display: flex; flex-direction: column; align-items: center; gap: 10px;">
@@ -424,7 +424,7 @@
                         </div>
                         <label style="display: flex; flex-direction: column; gap: 5px; width: 100%;">
                             Number of Layers:
-                            <input type="number" id="numLayers" min="1" max="10" value="1" style="width: 100%; box-sizing: border-box;">
+                            <input type="number" id="numLayers" min="1" max="4" value="1" style="width: 100%; box-sizing: border-box;">
                         </label>
                         <label style="display: flex; flex-direction: column; gap: 5px; width: 100%;">
                             Total Model Length (mm):
@@ -517,7 +517,7 @@
                         </div>
                         <label style="display: flex; flex-direction: column; gap: 5px; width: 100%;">
                             Number of Layers:
-                            <input type="number" id="numLayers" min="1" max="10" value="1" style="width: 100%; box-sizing: border-box;">
+                            <input type="number" id="numLayers" min="1" max="4" value="1" style="width: 100%; box-sizing: border-box;">
                         </label>
                         <label style="display: flex; flex-direction: column; gap: 5px; width: 100%;">
                             Total Model Length (mm):
@@ -975,6 +975,33 @@
             document.getElementById('layerSetup').style.display = 'none';
             document.getElementById('layersHeader').style.display = 'block';
             document.getElementById('selectionSection2').style.display = 'block';
+        });
+
+        // Validate Number of Layers input (enforce max 4)
+        document.getElementById('numLayers').addEventListener('change', () => {
+            const input = document.getElementById('numLayers');
+            let value = parseInt(input.value);
+            
+            if (value > 4) {
+                value = 4;
+                input.value = 4;
+                alert('Maximum 4 layers allowed. Value has been set to 4.');
+            } else if (value < 1) {
+                value = 1;
+                input.value = 1;
+                alert('Minimum 1 layer required. Value has been set to 1.');
+            }
+        });
+
+        document.getElementById('numLayers').addEventListener('input', () => {
+            const input = document.getElementById('numLayers');
+            let value = parseInt(input.value);
+            
+            if (value > 4) {
+                input.value = 4;
+            } else if (value < 1 && input.value !== '') {
+                input.value = 1;
+            }
         });
 
         // Reconfigure Layers

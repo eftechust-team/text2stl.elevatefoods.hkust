@@ -63,7 +63,8 @@ def generate_images():
 
 @app.route('/fast_generate_stl', methods=['POST'])
 def fast_generate_stl():
-    """Fast STL generation - extract main shape, fill solid, and generate STL."""
+    """Fast STL generation - creates a proper closed hollow shell from black pixels.
+    Generates top, bottom, and side walls without any filling."""
     data = request.json
     image_b64 = data['image']
     height_mm = float(data.get('height', 5.0))
@@ -77,36 +78,18 @@ def fast_generate_stl():
         image = image.convert('L')
         width, height = image.size
         
-        # Extract black outlines and fill inside
-        # 1. Threshold to binary (find black parts)
+        # Extract ONLY black pixels (dark areas)
         threshold = 128
-        binary = image.point(lambda p: 255 if p >= threshold else 0).convert('L')
+        image_array = np.array(image)
+        mask_array = image_array < threshold
         
-        # 2. Invert (so black becomes white, white becomes black)
-        binary = binary.point(lambda p: 255 - p)
-        
-        # 3. Find contours and fill them
-        mask_array = np.array(binary) > 128
-        
-        # Use morphological closing to fill gaps in outlines
-        from scipy.ndimage import binary_fill_holes, binary_closing
-        
-        # Close small gaps in the outline
-        mask_array = binary_closing(mask_array, structure=np.ones((5, 5)))
-        
-        # Fill holes to create solid shape
-        mask_array = binary_fill_holes(mask_array)
-        
-        # Generate STL from the filled mask
-        stl_content = generate_stl_from_contours(
+        # Generate STL as a proper closed hollow shell
+        stl_content = generate_hollow_shell_stl(
             mask_array,
             width,
             height,
             z_offset=0,
-            thickness=height_mm,
-            aa_enabled=True,
-            aa_upsample=2,
-            aa_sigma=0.5
+            thickness=height_mm
         )
         
         # Return STL directly (no ZIP for single file)
@@ -124,6 +107,13 @@ def generate_stl():
     data = request.json
     layers = data['layers']  # list of base64 images, one per layer
     num_layers = int(data['num_layers'])
+    
+    # Enforce maximum 4 layers
+    if num_layers > 4:
+        return jsonify({'error': 'Maximum 4 layers allowed. Please select 1, 2, 3, or 4 layers.'}), 400
+    if num_layers < 1:
+        return jsonify({'error': 'Minimum 1 layer required.'}), 400
+    
     heights = data.get('heights') or []
     positions = data.get('positions') or []
     dilation = int(data.get('dilation') or 2)
@@ -169,6 +159,12 @@ def generate_stl():
         else:
             z_offsets.append(z_offsets[idx - 1] + height_values[idx - 1])
     
+    # Get first layer dimensions as reference for all layers
+    first_image_data = base64.b64decode(layers[0])
+    first_image = Image.open(io.BytesIO(first_image_data))
+    first_image = first_image.convert('L')
+    reference_width, reference_height = first_image.size
+    
     try:
         for layer_idx, layer_image_b64 in enumerate(layers):
             # Decode base64 image
@@ -177,7 +173,12 @@ def generate_stl():
             
             # Convert to grayscale
             image = image.convert('L')
-            width, height = image.size
+            
+            # Normalize all layers to reference size for consistent scaling
+            if image.size != (reference_width, reference_height):
+                image = image.resize((reference_width, reference_height), Image.Resampling.LANCZOS)
+            
+            width, height = reference_width, reference_height
             
             # Optimized smoothing - skip upsampling here since contour generation handles it
             # close_size=1 and open_size=1 disable morphological closing/opening which would
@@ -294,6 +295,159 @@ def triangulate_with_holes(outer_verts, hole_verts_list):
     # all_verts in (row, col) order to match the rest of the codebase
     all_verts = np.vstack(rings)
     return tris, all_verts
+
+
+def generate_hollow_shell_stl(mask_array, width, height, z_offset, thickness):
+    """Generate a proper closed hollow shell from black pixels.
+    Creates top, bottom, and side wall faces without any filling."""
+    
+    if not np.any(mask_array):
+        return "solid layer\nendsolid layer\n"
+    
+    stl_lines = ["solid layer\n"]
+    z_top = z_offset + thickness
+    scale = 0.1
+    
+    try:
+        # Smooth the mask slightly to avoid jagged edges
+        smooth_field = filters.gaussian(mask_array.astype(float), sigma=0.5, preserve_range=True)
+        smooth_field = np.clip(smooth_field, 0, 1)
+        
+        # Find contours at 0.5 level
+        contours = measure.find_contours(smooth_field, 0.5)
+        
+        if not contours:
+            return "solid layer\nendsolid layer\n"
+        
+        # Filter tiny contours
+        filtered = [c for c in contours if len(c) >= 3 and abs(polygon_area(c)) >= 2.0]
+        
+        if not filtered:
+            return "solid layer\nendsolid layer\n"
+        
+        # Process each contour as an outer contour with potential holes
+        filtered_sorted = sorted(filtered, key=lambda c: abs(polygon_area(c)), reverse=True)
+        
+        # Classify as outer or hole
+        assigned_as_hole = [False] * len(filtered_sorted)
+        outer_with_holes = []
+        
+        for i in range(len(filtered_sorted)):
+            if assigned_as_hole[i]:
+                continue
+            holes_for_i = []
+            for j in range(i + 1, len(filtered_sorted)):
+                if assigned_as_hole[j]:
+                    continue
+                if contour_contains(filtered_sorted[i], filtered_sorted[j]):
+                    assigned_as_hole[j] = True
+                    holes_for_i.append(j)
+            outer_with_holes.append((i, holes_for_i))
+        
+        height_rescaled = smooth_field.shape[0]
+        width_rescaled = smooth_field.shape[1]
+        
+        # Build geometry for each outer contour + holes
+        for outer_idx, hole_indices in outer_with_holes:
+            outer_raw = filtered_sorted[outer_idx]
+            outer_simplified = simplify_contour(outer_raw, epsilon=0.8)
+            if len(outer_simplified) < 3:
+                continue
+            
+            outer_verts = ensure_ccw(outer_simplified)
+            
+            # Remove duplicate vertices
+            unique_verts = [outer_verts[0]]
+            for i in range(1, len(outer_verts)):
+                if np.linalg.norm(outer_verts[i] - unique_verts[-1]) > 0.1:
+                    unique_verts.append(outer_verts[i])
+            outer_verts = np.array(unique_verts)
+            
+            if len(outer_verts) < 3:
+                continue
+            
+            # Process holes
+            hole_verts_list = []
+            for hi in hole_indices:
+                h_raw = filtered_sorted[hi]
+                h_simplified = simplify_contour(h_raw, epsilon=0.8)
+                if len(h_simplified) < 3:
+                    continue
+                h_verts = ensure_ccw(h_simplified)[::-1]  # Make CW for holes
+                u = [h_verts[0]]
+                for i in range(1, len(h_verts)):
+                    if np.linalg.norm(h_verts[i] - u[-1]) > 0.1:
+                        u.append(h_verts[i])
+                if len(u) >= 3:
+                    hole_verts_list.append(np.array(u))
+            
+            # Triangulate outer contour
+            triangles, all_verts = triangulate_with_holes(outer_verts, hole_verts_list)
+            if not triangles:
+                triangles = triangulate_polygon_earclip(outer_verts)
+                if not triangles:
+                    continue
+                all_verts = outer_verts
+            
+            # ---- BOTTOM FACE ----
+            for tri in triangles:
+                v1 = [all_verts[tri[0]][1] * scale, (height_rescaled - all_verts[tri[0]][0]) * scale, z_offset]
+                v2 = [all_verts[tri[1]][1] * scale, (height_rescaled - all_verts[tri[1]][0]) * scale, z_offset]
+                v3 = [all_verts[tri[2]][1] * scale, (height_rescaled - all_verts[tri[2]][0]) * scale, z_offset]
+                tri_str = create_triangle(v1, v2, v3)
+                if tri_str:
+                    stl_lines.append(tri_str)
+            
+            # ---- TOP FACE (reversed winding) ----
+            for tri in triangles:
+                v1 = [all_verts[tri[2]][1] * scale, (height_rescaled - all_verts[tri[2]][0]) * scale, z_top]
+                v2 = [all_verts[tri[1]][1] * scale, (height_rescaled - all_verts[tri[1]][0]) * scale, z_top]
+                v3 = [all_verts[tri[0]][1] * scale, (height_rescaled - all_verts[tri[0]][0]) * scale, z_top]
+                tri_str = create_triangle(v1, v2, v3)
+                if tri_str:
+                    stl_lines.append(tri_str)
+            
+            # ---- SIDE WALLS for OUTER contour ----
+            for i in range(len(outer_verts)):
+                p1 = outer_verts[i]
+                p2 = outer_verts[(i + 1) % len(outer_verts)]
+                v1_b = [p1[1] * scale, (height_rescaled - p1[0]) * scale, z_offset]
+                v2_b = [p2[1] * scale, (height_rescaled - p2[0]) * scale, z_offset]
+                v1_t = [p1[1] * scale, (height_rescaled - p1[0]) * scale, z_top]
+                v2_t = [p2[1] * scale, (height_rescaled - p2[0]) * scale, z_top]
+                
+                tri_str = create_triangle(v1_b, v2_b, v1_t)
+                if tri_str:
+                    stl_lines.append(tri_str)
+                tri_str = create_triangle(v2_b, v2_t, v1_t)
+                if tri_str:
+                    stl_lines.append(tri_str)
+            
+            # ---- SIDE WALLS for HOLES (inner walls) ----
+            for hv in hole_verts_list:
+                for i in range(len(hv)):
+                    p1 = hv[i]
+                    p2 = hv[(i + 1) % len(hv)]
+                    v1_b = [p1[1] * scale, (height_rescaled - p1[0]) * scale, z_offset]
+                    v2_b = [p2[1] * scale, (height_rescaled - p2[0]) * scale, z_offset]
+                    v1_t = [p1[1] * scale, (height_rescaled - p1[0]) * scale, z_top]
+                    v2_t = [p2[1] * scale, (height_rescaled - p2[0]) * scale, z_top]
+                    
+                    tri_str = create_triangle(v1_b, v1_t, v2_b)
+                    if tri_str:
+                        stl_lines.append(tri_str)
+                    tri_str = create_triangle(v2_b, v1_t, v2_t)
+                    if tri_str:
+                        stl_lines.append(tri_str)
+    
+    except Exception as e:
+        print(f"Hollow shell generation error: {e}")
+        import traceback
+        traceback.print_exc()
+        return "solid layer\nendsolid layer\n"
+    
+    stl_lines.append("endsolid layer\n")
+    return ''.join(stl_lines)
 
 
 def generate_stl_from_contours(mask_array, width, height, z_offset, thickness, aa_enabled=True, aa_upsample=6, aa_sigma=0.35):
