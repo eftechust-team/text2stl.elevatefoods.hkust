@@ -319,8 +319,8 @@ def generate_hollow_shell_stl(mask_array, width, height, z_offset, thickness):
         if not contours:
             return "solid layer\nendsolid layer\n"
         
-        # Filter tiny contours
-        filtered = [c for c in contours if len(c) >= 3 and abs(polygon_area(c)) >= 2.0]
+        # Filter tiny contours - increase threshold to eliminate noise
+        filtered = [c for c in contours if len(c) >= 3 and abs(polygon_area(c)) >= 20.0]
         
         if not filtered:
             return "solid layer\nendsolid layer\n"
@@ -521,8 +521,8 @@ def generate_stl_from_contours(mask_array, width, height, z_offset, thickness, a
             print("  No contours found, using fallback")
             return generate_stl_from_points_fallback(mask_array, width, height, z_offset, thickness)
 
-        # Filter tiny contours; keep ALL valid ones (not just the largest)
-        filtered = [c for c in contours if len(c) >= 3 and abs(polygon_area(c)) >= 2.0]
+        # Filter tiny contours - increase threshold to eliminate noise
+        filtered = [c for c in contours if len(c) >= 3 and abs(polygon_area(c)) >= 20.0]
         
         if not filtered:
             print("  No valid contours after filtering")
