@@ -184,7 +184,7 @@ def generate_stl():
             # close_size=1 and open_size=1 disable morphological closing/opening which would
             # fill the inside of hollow/ring-shaped selections.
             if aa_enabled:
-                mask = smooth_binary_mask(image, threshold=edge_threshold, blur_radius=0.8, close_size=1, open_size=1)
+                mask = smooth_binary_mask(image, threshold=edge_threshold, blur_radius=1.5, close_size=1, open_size=1)
             else:
                 mask = smooth_binary_mask(image, threshold=edge_threshold, blur_radius=0, close_size=1, open_size=1)
             
@@ -303,8 +303,8 @@ def generate_hollow_shell_stl(mask_array, width, height, z_offset, thickness):
     
     stl_lines = ["solid layer\n"]
     z_top = z_offset + thickness
-    # Scale to fit model within ~10mm if image is ~100 pixels; adjust by actual dimensions
-    scale = 10.0 / max(width, height)
+    # Scale to fit model within ~50mm if image is ~100 pixels; adjust by actual dimensions
+    scale = 80.0 / max(width, height)
     
     try:
         # Smooth the mask slightly to avoid jagged edges
@@ -473,7 +473,7 @@ def generate_stl_from_contours(mask_array, width, height, z_offset, thickness, a
     upsample_factor = min(2, aa_upsample) if aa_enabled else 1
     # Scale to fit model within ~10mm if image is ~100 pixels; adjust by actual dimensions
     # This ensures position and size are correct relative to image dimensions
-    base_scale = 10.0 / max(width, height)  # Scale to ~10mm for a typical image
+    base_scale = 80.0 / max(width, height)  # Scale to ~80mm for a typical image
     scale = base_scale / max(1, upsample_factor)
     stl_lines = ["solid layer\n"]
 
@@ -908,6 +908,33 @@ def simplify_contour(contour, epsilon=0.5):
     result.append(contour[-1])
     return np.array(result) if len(result) >= 3 else contour
 
+def smooth_contour_vertices(vertices, num_passes=2, smooth_factor=0.5):
+    """Smooth contour vertices using Laplacian smoothing.
+    Reduces sharp corners and high-frequency noise while preserving overall shape.
+    """
+    if len(vertices) < 3:
+        return vertices
+    
+    smoothed = np.array(vertices, dtype=np.float64)
+    
+    for _ in range(num_passes):
+        new_smoothed = np.zeros_like(smoothed)
+        n = len(smoothed)
+        
+        for i in range(n):
+            # Get neighbors with wraparound for closed contours
+            prev_pt = smoothed[(i - 1) % n]
+            curr_pt = smoothed[i]
+            next_pt = smoothed[(i + 1) % n]
+            
+            # Laplacian smoothing: move point toward average of neighbors
+            avg_neighbors = (prev_pt + next_pt) / 2.0
+            new_smoothed[i] = curr_pt + smooth_factor * (avg_neighbors - curr_pt)
+        
+        smoothed = new_smoothed
+    
+    return smoothed
+
 
 def generate_stl_from_grid(mask_array, width, height, z_offset, thickness):
     """Generate STL using minimal surface approach - outer boundary only.
@@ -920,7 +947,7 @@ def generate_stl_from_grid(mask_array, width, height, z_offset, thickness):
     # Check for entire canvas selected (all True) - handle as special case
     if np.all(mask_array):
         # Entire canvas is selected - create a simple rectangular solid
-        scale = 10.0 / max(width, height)
+        scale = 80.0 / max(width, height)
         z_top = z_offset + thickness
         stl_lines = ["solid layer\n"]
         
@@ -960,96 +987,136 @@ def generate_stl_from_grid(mask_array, width, height, z_offset, thickness):
         if not contours:
             return "solid layer\nendsolid layer\n"
         
-        # Find the largest contour (outer boundary)
-        largest_contour = max(contours, key=lambda c: abs(polygon_area(c)))
+        # Filter out tiny contours to reduce noise
+        filtered = [c for c in contours if len(c) >= 3 and abs(polygon_area(c)) >= 5.0]
         
-        # Very aggressive simplification to reduce triangle count dramatically
-        # epsilon=2.0 removes 90%+ of points while preserving overall shape
-        simplified = simplify_contour(largest_contour, epsilon=2.0)
-        
-        if len(simplified) < 3:
+        if not filtered:
             return "solid layer\nendsolid layer\n"
         
-        # Scale for STL
-        scale = 10.0 / max(width, height)
+        # Sort contours by area (largest first) to identify outer boundaries
+        filtered_sorted = sorted(filtered, key=lambda c: abs(polygon_area(c)), reverse=True)
+        
+        # Classify contours as outer boundaries or holes
+        assigned_as_hole = [False] * len(filtered_sorted)
+        outer_with_holes = []
+        
+        for i in range(len(filtered_sorted)):
+            if assigned_as_hole[i]:
+                continue
+            holes_for_i = []
+            for j in range(i + 1, len(filtered_sorted)):
+                if assigned_as_hole[j]:
+                    continue
+                if contour_contains(filtered_sorted[i], filtered_sorted[j]):
+                    assigned_as_hole[j] = True
+                    holes_for_i.append(j)
+            outer_with_holes.append((i, holes_for_i))
+        
+        scale = 80.0 / max(width, height)
         z_top = z_offset + thickness
         stl_lines = ["solid layer\n"]
         
-        # Convert contour points to vertices in mm space
-        # Input is (row, col) = (y_img, x_img), output needs (x_mm, y_mm)
-        verts = []
-        for pt in simplified:
-            x_mm = pt[1] * scale          # col -> x
-            y_mm = (height - pt[0]) * scale  # row -> y (inverted)
-            verts.append(np.array([x_mm, y_mm]))
-        
-        verts = np.array(verts)
-        
-        if len(verts) < 3:
-            return "solid layer\nendsolid layer\n"
-        
-        # Triangulate the polygon using earcut
-        try:
-            # Prepare coordinates in the format earcut expects: [[x,y], [x,y], ...]
-            coords = np.array([[float(v[0]), float(v[1])] for v in verts], dtype=np.float64)
-            ring_ends = np.array([len(verts)], dtype=np.uint32)
+        # Process each outer contour with its holes
+        for outer_idx, hole_indices in outer_with_holes:
+            outer_raw = filtered_sorted[outer_idx]
+            outer_simplified = simplify_contour(outer_raw, epsilon=1.5)
             
-            # Triangulate
-            triangles_flat = earcut.triangulate_float64(coords, ring_ends)
+            if len(outer_simplified) < 3:
+                continue
             
-            # Convert flat index array to triangle tuples
-            triangles = []
-            for i in range(0, len(triangles_flat), 3):
-                if i + 2 < len(triangles_flat):
-                    triangles.append((triangles_flat[i], triangles_flat[i+1], triangles_flat[i+2]))
-        except Exception as e:
-            print(f"Earcut failed: {e}, using fan triangulation")
-            # Fallback: simple fan triangulation from first vertex
-            triangles = []
-            for i in range(1, len(verts) - 1):
-                triangles.append((0, i, i + 1))
-        
-        if not triangles:
-            return "solid layer\nendsolid layer\n"
-        
-        # Create bottom face
-        for i0, i1, i2 in triangles:
-            v1 = [verts[i0][0], verts[i0][1], z_offset]
-            v2 = [verts[i1][0], verts[i1][1], z_offset]
-            v3 = [verts[i2][0], verts[i2][1], z_offset]
-            tri_str = create_triangle(v1, v2, v3)
-            if tri_str:
-                stl_lines.append(tri_str)
-        
-        # Create top face (reverse winding)
-        for i0, i1, i2 in triangles:
-            v1 = [verts[i2][0], verts[i2][1], z_top]
-            v2 = [verts[i1][0], verts[i1][1], z_top]
-            v3 = [verts[i0][0], verts[i0][1], z_top]
-            tri_str = create_triangle(v1, v2, v3)
-            if tri_str:
-                stl_lines.append(tri_str)
-        
-        # Create side wall perimeter
-        for i in range(len(verts)):
-            p1 = verts[i]
-            p2 = verts[(i + 1) % len(verts)]
+            # Convert outer contour to image-space coordinates (row, col)
+            outer_verts_img = np.array(outer_simplified)
+            outer_verts_img = ensure_ccw(outer_verts_img)
+            # Apply Laplacian smoothing to reduce sharp corners
+            outer_verts_img = smooth_contour_vertices(outer_verts_img, num_passes=3, smooth_factor=0.6)
             
-            # Bottom edge vertices
-            v1_b = [p1[0], p1[1], z_offset]
-            v2_b = [p2[0], p2[1], z_offset]
-            # Top edge vertices
-            v1_t = [p1[0], p1[1], z_top]
-            v2_t = [p2[0], p2[1], z_top]
+            # Process holes
+            hole_verts_list = []
+            for hi in hole_indices:
+                h_raw = filtered_sorted[hi]
+                h_simplified = simplify_contour(h_raw, epsilon=1.5)
+                if len(h_simplified) < 3:
+                    continue
+                h_verts = ensure_ccw(h_simplified)[::-1]  # Make CW for holes
+                # Apply Laplacian smoothing to hole vertices as well
+                h_verts = smooth_contour_vertices(h_verts, num_passes=3, smooth_factor=0.6)
+                hole_verts_list.append(np.array(h_verts))
             
-            # Two triangles for the wall segment
-            tri_str = create_triangle(v1_b, v2_b, v1_t)
-            if tri_str:
-                stl_lines.append(tri_str)
+            # Triangulate with holes
+            triangles, all_verts = triangulate_with_holes(outer_verts_img, hole_verts_list)
             
-            tri_str = create_triangle(v2_b, v2_t, v1_t)
-            if tri_str:
-                stl_lines.append(tri_str)
+            if not triangles:
+                continue
+            
+            # Convert vertices from image-space (row, col) to mm-space
+            verts_mm = []
+            for pt in all_verts:
+                x_mm = pt[1] * scale          # col -> x
+                y_mm = (height - pt[0]) * scale  # row -> y (inverted)
+                verts_mm.append([x_mm, y_mm])
+            verts_mm = np.array(verts_mm)
+            
+            # Create bottom face
+            for i0, i1, i2 in triangles:
+                v1 = [verts_mm[i0][0], verts_mm[i0][1], z_offset]
+                v2 = [verts_mm[i1][0], verts_mm[i1][1], z_offset]
+                v3 = [verts_mm[i2][0], verts_mm[i2][1], z_offset]
+                tri_str = create_triangle(v1, v2, v3)
+                if tri_str:
+                    stl_lines.append(tri_str)
+            
+            # Create top face (reverse winding)
+            for i0, i1, i2 in triangles:
+                v1 = [verts_mm[i2][0], verts_mm[i2][1], z_top]
+                v2 = [verts_mm[i1][0], verts_mm[i1][1], z_top]
+                v3 = [verts_mm[i0][0], verts_mm[i0][1], z_top]
+                tri_str = create_triangle(v1, v2, v3)
+                if tri_str:
+                    stl_lines.append(tri_str)
+            
+            # Create side wall perimeter (outer boundary)
+            for i in range(len(outer_verts_img)):
+                p1_img = outer_verts_img[i]
+                p2_img = outer_verts_img[(i + 1) % len(outer_verts_img)]
+                
+                p1 = [p1_img[1] * scale, (height - p1_img[0]) * scale]
+                p2 = [p2_img[1] * scale, (height - p2_img[0]) * scale]
+                
+                v1_b = [p1[0], p1[1], z_offset]
+                v2_b = [p2[0], p2[1], z_offset]
+                v1_t = [p1[0], p1[1], z_top]
+                v2_t = [p2[0], p2[1], z_top]
+                
+                tri_str = create_triangle(v1_b, v2_b, v1_t)
+                if tri_str:
+                    stl_lines.append(tri_str)
+                
+                tri_str = create_triangle(v2_b, v2_t, v1_t)
+                if tri_str:
+                    stl_lines.append(tri_str)
+            
+            # Create side wall perimeter for holes (inner boundaries)
+            for hole_verts_img in hole_verts_list:
+                for i in range(len(hole_verts_img)):
+                    p1_img = hole_verts_img[i]
+                    p2_img = hole_verts_img[(i + 1) % len(hole_verts_img)]
+                    
+                    p1 = [p1_img[1] * scale, (height - p1_img[0]) * scale]
+                    p2 = [p2_img[1] * scale, (height - p2_img[0]) * scale]
+                    
+                    v1_b = [p1[0], p1[1], z_offset]
+                    v2_b = [p2[0], p2[1], z_offset]
+                    v1_t = [p1[0], p1[1], z_top]
+                    v2_t = [p2[0], p2[1], z_top]
+                    
+                    # Reverse winding for hole walls (inside-facing)
+                    tri_str = create_triangle(v2_b, v1_b, v1_t)
+                    if tri_str:
+                        stl_lines.append(tri_str)
+                    
+                    tri_str = create_triangle(v2_t, v2_b, v1_t)
+                    if tri_str:
+                        stl_lines.append(tri_str)
         
         stl_lines.append("endsolid layer\n")
         return ''.join(stl_lines)
