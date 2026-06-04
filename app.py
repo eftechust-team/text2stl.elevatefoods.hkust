@@ -306,7 +306,8 @@ def generate_hollow_shell_stl(mask_array, width, height, z_offset, thickness):
     
     stl_lines = ["solid layer\n"]
     z_top = z_offset + thickness
-    scale = 0.1
+    # Scale to fit model within ~10mm if image is ~100 pixels; adjust by actual dimensions
+    scale = 10.0 / max(width, height)
     
     try:
         # Smooth the mask slightly to avoid jagged edges
@@ -473,7 +474,10 @@ def generate_stl_from_contours(mask_array, width, height, z_offset, thickness, a
 
     # Aggressive optimization - minimal upsampling
     upsample_factor = min(2, aa_upsample) if aa_enabled else 1
-    scale = 0.1 / max(1, upsample_factor)
+    # Scale to fit model within ~10mm if image is ~100 pixels; adjust by actual dimensions
+    # This ensures position and size are correct relative to image dimensions
+    base_scale = 10.0 / max(width, height)  # Scale to ~10mm for a typical image
+    scale = base_scale / max(1, upsample_factor)
     stl_lines = ["solid layer\n"]
 
     try:
