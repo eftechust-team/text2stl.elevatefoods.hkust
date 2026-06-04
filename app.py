@@ -913,11 +913,6 @@ def generate_stl_from_grid(mask_array, width, height, z_offset, thickness):
     """Generate STL using minimal surface approach - outer boundary only.
     Creates just outer contour with top/bottom and side walls.
     Vastly simpler than grid-based (only outer surface, not per-pixel).
-    
-    This is the fastest approach for PrusaSlicer repair because it:
-    - Extracts only outer boundary contour
-    - Triangulates just the boundary (minimal triangles)
-    - Has simple, predictable topology
     """
     if not np.any(mask_array):
         return "solid layer\nendsolid layer\n"
@@ -932,7 +927,8 @@ def generate_stl_from_grid(mask_array, width, height, z_offset, thickness):
         # Find the largest contour (outer boundary)
         largest_contour = max(contours, key=lambda c: abs(polygon_area(c)))
         
-        # Aggressive simplification to reduce triangle count
+        # Very aggressive simplification to reduce triangle count dramatically
+        # epsilon=2.0 removes 90%+ of points while preserving overall shape
         simplified = simplify_contour(largest_contour, epsilon=2.0)
         
         if len(simplified) < 3:
@@ -943,55 +939,74 @@ def generate_stl_from_grid(mask_array, width, height, z_offset, thickness):
         z_top = z_offset + thickness
         stl_lines = ["solid layer\n"]
         
-        # Convert contour to vertex array (note: contour is in (y,x) format)
+        # Convert contour points to vertices in mm space
+        # Input is (row, col) = (y_img, x_img), output needs (x_mm, y_mm)
         verts = []
         for pt in simplified:
-            verts.append([pt[1] * scale, (height - pt[0]) * scale])  # Convert to (x,y) in mm
+            x_mm = pt[1] * scale          # col -> x
+            y_mm = (height - pt[0]) * scale  # row -> y (inverted)
+            verts.append(np.array([x_mm, y_mm]))
         
         verts = np.array(verts)
         
-        # Simple triangulation of the polygon - use earcut for the outer contour
+        if len(verts) < 3:
+            return "solid layer\nendsolid layer\n"
+        
+        # Triangulate the polygon using earcut
         try:
-            coords = [[float(v[0]), float(v[1])] for v in verts]
-            coords_array = np.array(coords, dtype=np.float64)
-            triangles_flat = earcut.triangulate_float64(coords_array, np.array([len(verts)], dtype=np.uint32))
-            triangles = [(triangles_flat[i], triangles_flat[i+1], triangles_flat[i+2]) 
-                        for i in range(0, len(triangles_flat), 3)]
-        except:
-            # Fallback: simple fan triangulation
+            # Prepare coordinates in the format earcut expects: [[x,y], [x,y], ...]
+            coords = np.array([[float(v[0]), float(v[1])] for v in verts], dtype=np.float64)
+            ring_ends = np.array([len(verts)], dtype=np.uint32)
+            
+            # Triangulate
+            triangles_flat = earcut.triangulate_float64(coords, ring_ends)
+            
+            # Convert flat index array to triangle tuples
+            triangles = []
+            for i in range(0, len(triangles_flat), 3):
+                if i + 2 < len(triangles_flat):
+                    triangles.append((triangles_flat[i], triangles_flat[i+1], triangles_flat[i+2]))
+        except Exception as e:
+            print(f"Earcut failed: {e}, using fan triangulation")
+            # Fallback: simple fan triangulation from first vertex
             triangles = []
             for i in range(1, len(verts) - 1):
                 triangles.append((0, i, i + 1))
         
-        # Bottom face
-        for tri in triangles:
-            v1 = list(verts[tri[0]]) + [z_offset]
-            v2 = list(verts[tri[1]]) + [z_offset]
-            v3 = list(verts[tri[2]]) + [z_offset]
+        if not triangles:
+            return "solid layer\nendsolid layer\n"
+        
+        # Create bottom face
+        for i0, i1, i2 in triangles:
+            v1 = [verts[i0][0], verts[i0][1], z_offset]
+            v2 = [verts[i1][0], verts[i1][1], z_offset]
+            v3 = [verts[i2][0], verts[i2][1], z_offset]
             tri_str = create_triangle(v1, v2, v3)
             if tri_str:
                 stl_lines.append(tri_str)
         
-        # Top face (reversed winding)
-        for tri in triangles:
-            v1 = list(verts[tri[2]]) + [z_top]
-            v2 = list(verts[tri[1]]) + [z_top]
-            v3 = list(verts[tri[0]]) + [z_top]
+        # Create top face (reverse winding)
+        for i0, i1, i2 in triangles:
+            v1 = [verts[i2][0], verts[i2][1], z_top]
+            v2 = [verts[i1][0], verts[i1][1], z_top]
+            v3 = [verts[i0][0], verts[i0][1], z_top]
             tri_str = create_triangle(v1, v2, v3)
             if tri_str:
                 stl_lines.append(tri_str)
         
-        # Side walls - create walls around the perimeter
+        # Create side wall perimeter
         for i in range(len(verts)):
             p1 = verts[i]
             p2 = verts[(i + 1) % len(verts)]
             
+            # Bottom edge vertices
             v1_b = [p1[0], p1[1], z_offset]
             v2_b = [p2[0], p2[1], z_offset]
+            # Top edge vertices
             v1_t = [p1[0], p1[1], z_top]
             v2_t = [p2[0], p2[1], z_top]
             
-            # Create two triangles for the wall
+            # Two triangles for the wall segment
             tri_str = create_triangle(v1_b, v2_b, v1_t)
             if tri_str:
                 stl_lines.append(tri_str)
@@ -1005,6 +1020,8 @@ def generate_stl_from_grid(mask_array, width, height, z_offset, thickness):
     
     except Exception as e:
         print(f"Error in generate_stl_from_grid: {e}")
+        import traceback
+        traceback.print_exc()
         return "solid layer\nendsolid layer\n"
 
 
